@@ -591,6 +591,7 @@ void cp210x_usb_get_line(Cp210xLine* line) {
     line->rts = cp.rts;
     line->brk = cp.brk;
     line->embed_escape = cp.embed_escape;
+    line->port_open = cp.enabled; /* hosts send IFC_ENABLE when they open the port */
     FURI_CRITICAL_EXIT();
 }
 
@@ -655,3 +656,33 @@ void cp210x_usb_report_error(uint32_t error_bits) {
     cp.errors |= error_bits;
     FURI_CRITICAL_EXIT();
 }
+
+static const char* cp_request_name(uint8_t r) {
+    static const char* const names[] = {
+        "IFC_EN",  "SBAUDDIV", "GBAUDDIV", "SLINE",    "GLINE",   "BREAK",   "IMMCHAR",
+        "SMHS",    "GMDMSTS",  "XON",      "XOFF",     "SEVMASK", "GEVMASK", "SCHAR",
+        "GCHARS",  "GPROPS",   "GCOMMST",  "RESET",    "PURGE",   "SFLOW",   "GFLOW",
+        "EMBED",   "GEVSTATE", NULL,       NULL,       "SCHARS",  NULL,      NULL,
+        NULL,      "GBAUD",    "SBAUD"};
+    if(r < sizeof(names) / sizeof(names[0]) && names[r]) return names[r];
+    if(r == CP210X_VENDOR_SPECIFIC) return "VENDOR";
+    return "?";
+}
+
+const UsbUartBackend usb_uart_cp2102 = {
+    .name = "CP2102",
+    .max_write = CP_EP_SIZE,
+    .start = cp210x_usb_start,
+    .stop = cp210x_usb_stop,
+    .get_line = cp210x_usb_get_line,
+    .read = cp210x_usb_read,
+    .take_imm_char = cp210x_usb_take_imm_char,
+    .take_purge = cp210x_usb_take_purge,
+    .tx_ready = cp210x_usb_tx_ready,
+    .write = cp210x_usb_write,
+    .set_queue_levels = cp210x_usb_set_queue_levels,
+    .report_error = cp210x_usb_report_error,
+    .get_log = cp210x_usb_get_log,
+    .get_counts = cp210x_usb_get_counts,
+    .request_name = cp_request_name,
+};

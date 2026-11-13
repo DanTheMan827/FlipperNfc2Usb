@@ -1,5 +1,5 @@
 #include "bridge.h"
-#include "cp210x_usb.h"
+#include "usb_uart.h"
 #include "mfrc522.h"
 #include "rf.h"
 
@@ -14,8 +14,9 @@
 #define BF_POWER    (1U << 5)
 #define BF_SETTINGS (1U << 6)
 #define BF_STOP     (1U << 7)
-#define BF_ALL      (CP210X_FLAG_RX | CP210X_FLAG_TX | CP210X_FLAG_CONFIG | CP210X_FLAG_LINE | \
-                BF_RF_DONE | BF_POWER | BF_SETTINGS | BF_STOP)
+#define BF_ALL                                                                 \
+    (USB_UART_FLAG_RX | USB_UART_FLAG_TX | USB_UART_FLAG_CONFIG | USB_UART_FLAG_LINE | \
+     BF_RF_DONE | BF_POWER | BF_SETTINGS | BF_STOP)
 
 #define WIRE_SIZE        256
 #define IDLE_WAIT_MS     50
@@ -41,6 +42,7 @@ struct Bridge {
     FuriMessageQueue* rf_results;
     Mfrc522* chip;
     Rf* rf;
+    const UsbUartBackend* usb;
 
     BridgeSettings settings; /* shared, guarded by mutex */
     BridgeSettings active; /* worker copy */
@@ -48,7 +50,7 @@ struct Bridge {
 
     Wire to_chip;
     Wire to_host;
-    Cp210xLine line;
+    UsbUartLine line;
 
     uint32_t last_cyc;
     uint32_t acc_cyc;
@@ -167,7 +169,7 @@ static void hook_uart_tx(uint8_t byte, void* ctx) {
     bool err = !bridge_line_works(b);
     uint64_t now_ns = bridge_clock_us(b) * 1000U;
     if(!wire_push(&b->to_host, byte, err, now_ns, bridge_char_ns(b))) {
-        cp210x_usb_report_error(CP210X_ERROR_QUEUE);
+        b->usb->report_error(USB_UART_ERROR_QUEUE);
     }
 }
 
@@ -206,12 +208,12 @@ static void bridge_power_cycle_chip(Bridge* b) {
 static void bridge_pump_from_usb(Bridge* b, uint64_t now_ns) {
     uint64_t char_ns = bridge_char_ns(b);
     uint8_t c;
-    if(cp210x_usb_take_imm_char(&c) && b->line.enabled) {
+    if(b->usb->take_imm_char(&c) && b->line.enabled) {
         wire_push(&b->to_chip, c, false, now_ns, char_ns);
     }
     uint8_t buf[64];
     while(b->to_chip.count < WIRE_SIZE - sizeof(buf)) {
-        size_t n = cp210x_usb_read(buf, sizeof(buf));
+        size_t n = b->usb->read(buf, sizeof(buf));
         if(n == 0) break;
         for(size_t i = 0; i < n; i++) {
             wire_push(&b->to_chip, buf[i], false, now_ns, char_ns);
@@ -236,7 +238,7 @@ static void bridge_deliver_to_chip(Bridge* b) {
 }
 
 static void bridge_pump_to_usb(Bridge* b) {
-    if(!b->to_host.count || !cp210x_usb_tx_ready()) return;
+    if(!b->to_host.count || !b->usb->tx_ready()) return;
     uint64_t now_ns = bridge_clock_us(b) * 1000U;
     uint8_t esc = b->line.embed_escape;
     uint8_t pkt[64];
@@ -247,10 +249,10 @@ static void bridge_pump_to_usb(Bridge* b) {
         uint8_t d = b->to_host.data[h];
         bool err = b->to_host.err[h] != 0;
         size_t need = err ? (esc ? 4U : 0U) : ((esc && d == esc) ? 2U : 1U);
-        if(n + need > sizeof(pkt)) break;
+        if(n + need > b->usb->max_write) break;
         if(err) {
             b->framing_errors++;
-            cp210x_usb_report_error(CP210X_ERROR_FRAMING);
+            b->usb->report_error(USB_UART_ERROR_FRAMING);
             if(esc) {
                 /* Embedded event: ESC, 01, LSR (framing error), data */
                 pkt[n++] = esc;
@@ -267,7 +269,7 @@ static void bridge_pump_to_usb(Bridge* b) {
         if(!err) b->bytes_to_host++;
         wire_pop(&b->to_host);
     }
-    if(n) cp210x_usb_write(pkt, n);
+    if(n) b->usb->write(pkt, n);
 }
 
 static void bridge_publish_status(Bridge* b) {
@@ -277,7 +279,8 @@ static void bridge_publish_status(Bridge* b) {
     BridgeStatus* s = &b->status;
     s->usb_ok = b->usb_ok;
     s->usb_configured = b->line.configured;
-    s->port_open = b->line.enabled;
+    s->port_open = b->line.port_open;
+    s->adapter = b->usb->name;
     s->host_baud = b->line.baud;
     s->line_ctl = b->line.line_ctl;
     s->chip_baud = cs.uart_baud;
@@ -304,7 +307,7 @@ static uint32_t bridge_wait_ms(Bridge* b) {
     if(b->to_chip.count) {
         next_us = b->to_chip.due_ns[b->to_chip.head] / 1000U;
     }
-    if(b->to_host.count && cp210x_usb_tx_ready()) {
+    if(b->to_host.count && b->usb->tx_ready()) {
         uint64_t t = b->to_host.due_ns[b->to_host.head] / 1000U;
         if(t < next_us) next_us = t;
     }
@@ -333,7 +336,7 @@ static int32_t bridge_worker(void* context) {
             mfrc522_set_version(b->chip, b->active.version);
         }
 
-        cp210x_usb_get_line(&b->line);
+        b->usb->get_line(&b->line);
 
         if(b->line.configured != b->was_configured) {
             /* Bus power applied / removed: the MFRC522 module is powered by the adapter */
@@ -342,9 +345,9 @@ static int32_t bridge_worker(void* context) {
         }
         if(flags & BF_POWER) bridge_power_cycle_chip(b);
 
-        uint32_t purge = cp210x_usb_take_purge();
-        if(purge & CP210X_PURGE_TX) wire_clear(&b->to_chip);
-        if(purge & CP210X_PURGE_RX) wire_clear(&b->to_host);
+        uint32_t purge = b->usb->take_purge();
+        if(purge & USB_UART_PURGE_TX) wire_clear(&b->to_chip);
+        if(purge & USB_UART_PURGE_RX) wire_clear(&b->to_host);
         if(!b->line.enabled) {
             wire_clear(&b->to_chip);
             wire_clear(&b->to_host);
@@ -360,7 +363,7 @@ static int32_t bridge_worker(void* context) {
         mfrc522_tick(b->chip);
         bridge_pump_to_usb(b);
 
-        cp210x_usb_set_queue_levels(b->to_host.count, b->to_chip.count);
+        b->usb->set_queue_levels(b->to_host.count, b->to_chip.count);
         bridge_publish_status(b);
         wait_ms = bridge_wait_ms(b);
     }
@@ -393,6 +396,7 @@ Bridge* bridge_alloc(const BridgeSettings* settings) {
     };
     b->chip = mfrc522_alloc(&hooks);
     mfrc522_set_version(b->chip, settings->version);
+    b->usb = settings->adapter == BridgeAdapterCp2102 ? &usb_uart_cp2102 : &usb_uart_cdc;
 
     b->thread = furi_thread_alloc_ex("Mfrc522Bridge", 4 * 1024, bridge_worker, b);
     return b;
@@ -400,7 +404,7 @@ Bridge* bridge_alloc(const BridgeSettings* settings) {
 
 bool bridge_start(Bridge* b) {
     furi_thread_start(b->thread);
-    b->usb_ok = cp210x_usb_start(furi_thread_get_id(b->thread));
+    b->usb_ok = b->usb->start(furi_thread_get_id(b->thread));
     furi_thread_flags_set(furi_thread_get_id(b->thread), BF_SETTINGS);
     return b->usb_ok;
 }
@@ -409,7 +413,7 @@ void bridge_free(Bridge* b) {
     furi_thread_flags_set(furi_thread_get_id(b->thread), BF_STOP);
     furi_thread_join(b->thread);
     furi_thread_free(b->thread);
-    if(b->usb_ok) cp210x_usb_stop();
+    if(b->usb_ok) b->usb->stop();
     rf_free(b->rf);
     mfrc522_free(b->chip);
     furi_message_queue_free(b->rf_results);

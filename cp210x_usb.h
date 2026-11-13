@@ -1,75 +1,40 @@
 /**
  * USB device personality of a Silicon Labs CP2102 USB-to-UART bridge
  * (VID 10C4, PID EA60), including its vendor-specific control protocol (AN571).
+ * Used through the generic UsbUartBackend interface (usb_uart_cp2102).
  */
 #pragma once
 
-#include <furi.h>
-#include <stdint.h>
-#include <stdbool.h>
+#include "usb_uart.h"
 
-/* Thread flags raised on the notify thread */
-#define CP210X_FLAG_RX     (1U << 0) /* data from host available */
-#define CP210X_FLAG_TX     (1U << 1) /* IN endpoint free again */
-#define CP210X_FLAG_CONFIG (1U << 2) /* USB configured / deconfigured */
-#define CP210X_FLAG_LINE   (1U << 3) /* line settings / purge / enable changed */
+/* CP210x names for the shared flags and error bits */
+#define CP210X_FLAG_RX     USB_UART_FLAG_RX
+#define CP210X_FLAG_TX     USB_UART_FLAG_TX
+#define CP210X_FLAG_CONFIG USB_UART_FLAG_CONFIG
+#define CP210X_FLAG_LINE   USB_UART_FLAG_LINE
 
-/* PURGE bits as seen by the UART side */
-#define CP210X_PURGE_TX (1U << 0) /* host -> UART queue */
-#define CP210X_PURGE_RX (1U << 1) /* UART -> host queue */
+#define CP210X_PURGE_TX USB_UART_PURGE_TX
+#define CP210X_PURGE_RX USB_UART_PURGE_RX
 
-/* Line status bits for embedded events / comm status */
-#define CP210X_ERROR_BREAK   0x01
-#define CP210X_ERROR_FRAMING 0x02
-#define CP210X_ERROR_OVERRUN 0x04
-#define CP210X_ERROR_QUEUE   0x08
-#define CP210X_ERROR_PARITY  0x10
+#define CP210X_ERROR_BREAK   USB_UART_ERROR_BREAK
+#define CP210X_ERROR_FRAMING USB_UART_ERROR_FRAMING
+#define CP210X_ERROR_OVERRUN USB_UART_ERROR_OVERRUN
+#define CP210X_ERROR_QUEUE   USB_UART_ERROR_QUEUE
+#define CP210X_ERROR_PARITY  USB_UART_ERROR_PARITY
 
-typedef struct {
-    bool configured; /* USB configuration selected by host */
-    bool enabled; /* IFC_ENABLE */
-    uint32_t baud;
-    uint16_t line_ctl; /* [15:8] data bits, [7:4] parity, [3:0] stop bits */
-    bool dtr;
-    bool rts;
-    bool brk;
-    uint8_t embed_escape; /* 0 = embedded events disabled */
-} Cp210xLine;
+#define CP210X_LOG_SIZE USB_UART_LOG_SIZE
+typedef UsbUartLine Cp210xLine;
+typedef UsbUartCtlLog Cp210xCtlLog;
 
-/** Switch the Flipper USB port to the CP2102 personality. */
 bool cp210x_usb_start(FuriThreadId notify_thread);
-/** Restore the previous USB personality. */
 void cp210x_usb_stop(void);
-
 void cp210x_usb_get_line(Cp210xLine* line);
-
-/** Read bytes the host sent (OUT endpoint). */
 size_t cp210x_usb_read(uint8_t* buf, size_t max);
-/** Pending IMM_CHAR request, returns true and the char if there is one. */
 bool cp210x_usb_take_imm_char(uint8_t* c);
-/** PURGE bits requested since the last call (CP210X_PURGE_*). */
 uint32_t cp210x_usb_take_purge(void);
-
 bool cp210x_usb_tx_ready(void);
-/** Send up to 64 bytes on the IN endpoint. */
 bool cp210x_usb_write(const uint8_t* buf, size_t len);
-
-/** Queue depths reported by GET_COMM_STATUS. */
 void cp210x_usb_set_queue_levels(uint32_t to_host, uint32_t to_uart);
-/** Latch line errors reported by GET_COMM_STATUS (CP210X_ERROR_*). */
 void cp210x_usb_report_error(uint32_t error_bits);
-
-/* Diagnostics: the last vendor control requests the host sent. */
-#define CP210X_LOG_SIZE 8
-typedef struct {
-    uint8_t request; /* bRequest */
-    bool in; /* device-to-host */
-    bool stalled; /* answered with a STALL */
-    uint16_t value;
-    uint16_t length;
-} Cp210xCtlLog;
-
-/** Copy the log, oldest first. Returns the number of entries. */
 size_t cp210x_usb_get_log(Cp210xCtlLog* out, size_t max);
-/** Total vendor requests and how many were stalled since start. */
 void cp210x_usb_get_counts(uint32_t* total, uint32_t* stalled);

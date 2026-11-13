@@ -1,14 +1,17 @@
-# Rfid2Usb: USB NFC reader emulator for Flipper Zero
+# NFC2USB: USB NFC reader emulator for Flipper Zero
 
 When the app starts, it asks which USB device the Flipper should become. Press **Back** on a status screen to return to the menu; that also restores the Flipper's normal USB.
 
 | Mode | USB identity | Host side |
 |---|---|---|
-| MFRC522 UART (CP2102) | Silicon Labs CP2102, `10C4:EA60` | Serial port; NXP MFRC522 register protocol in UART mode |
+| MFRC522 UART (CDC), the default | Generic USB CDC-ACM serial port, `1209:0001` | Serial port; NXP MFRC522 register protocol in UART mode. No driver needed on Windows 10+, macOS or Linux |
+| MFRC522 UART (CP2102) | Silicon Labs CP2102, `10C4:EA60` | The same, behind an emulated CP2102 for software that looks for that adapter |
 | ACS ACR122U | `072F:2200`, "ACS" / "ACR122U PICC Interface" | USB CCID reader (PC/SC), PN532 inside |
 | ACS ACR1552U | `072F:2303`, "ACS" / "ACR1552 1S CL Reader", PICC + SAM interfaces | USB CCID reader (PC/SC) |
 
 RF goes through the Flipper's own NFC antenna, so real cards answer.
+
+Settings are saved to `apps_data/mfrc522_uart/settings.bin` on the SD card whenever they change: the MFRC522 adapter (CDC or CP2102), chip version, Strict UART, wire timing and the reader buzzer.
 
 ## Build and run
 
@@ -19,7 +22,7 @@ ufbt            # builds dist/mfrc522_uart.fap
 ufbt launch     # builds, installs and starts it over USB
 ```
 
-The app lives under **Apps → NFC → Rfid2Usb**. It targets firmware 1.5.1 (API 88.x). Every exported firmware function it calls was checked against `targets/f7/api_symbols.csv` of that release. While a mode is running, qFlipper and the CLI are disconnected.
+The app lives under **Apps → USB → NFC2USB**. It targets firmware 1.5.1 (API 88.x). Every exported firmware function it calls was checked against `targets/f7/api_symbols.csv` of that release. While a mode is running, qFlipper and the CLI are disconnected.
 
 ## Card types
 
@@ -41,6 +44,19 @@ The app lives under **Apps → NFC → Rfid2Usb**. It targets firmware 1.5.1 (AP
 | ISO14443 at 212/424/848 kbit/s | ✗ | — | ✗ | The library configures ISO14443 at 106 kbit/s only |
 
 ## MFRC522 UART mode
+
+The simulated chip sits behind one of two USB serial adapters, chosen under **USB adapter** in the settings (**Config**, the OK button, on the status screen). Changing it re-plugs the Flipper as the other adapter.
+
+### CDC side (default)
+
+A standard USB CDC-ACM device (CDC PSTN 1.2), so every current OS uses its built-in serial driver. The ID is the pid.codes test VID/PID `1209:0001`, which no vendor driver claims.
+
+* SET_LINE_CODING / GET_LINE_CODING: any rate, 5–8 data bits, none/odd/even/mark/space parity, 1/1.5/2 stop bits; anything else stalls.
+* SET_CONTROL_LINE_STATE: DTR and RTS. DTR is shown as "Port open", since hosts raise it when they open the port; data flows either way.
+* SEND_BREAK: on, off and timed.
+* SERIAL_STATE notifications: carrier (DCD/DSR) when the port opens, and framing errors.
+* Interface protocol 0 (no AT commands), so Linux ModemManager leaves the port alone.
+* Writes to the host are at most 63 bytes, so every packet is short and hosts reading with large buffers get the data at once.
 
 ### CP2102 side (AN571 vendor protocol)
 
@@ -69,7 +85,9 @@ When the host deconfigures USB, the module loses power and the chip is power-cyc
 * **Timer:** TPrescalEven takes effect only on v2.0 silicon. TAuto stops after the 5th received bit. TAutoRestart is supported.
 * **Soft power-down:** exits 1024 clocks (about 38 µs) after PowerDown is cleared.
 * **Status line** `Chip <baud> (<SerialSpeedReg>) <state>`: the rate the chip's register selects (`EBh` = 9631 Bd at power-on). State is `ok` when the host port matches it (±3 %, 8N1), `=host` when it doesn't but Strict UART is off so the chip is assumed to follow the host, `MISMATCH` when it doesn't and Strict UART is on (bytes are garbled, as on real wires), and `OVERSPD` above 1228.8 kBd.
-* **Settings** (press **OK** on the status screen):
+* **Status screen:** adapter and host port (`CDC open 921600 8N1`), the chip's own rate, RF state with the running command, and the last RF exchange. The button bar at the bottom opens **Config** (OK) and the **USB log** (Right): the last control requests the host sent and whether the Flipper accepted them. **Status** (Left or Back) returns from the log.
+* **Settings** (**Config** on the status screen):
+  * USB adapter: CDC or CP2102
   * chip version
   * Strict UART: rates and framing must match, as on real wires
   * wire timing: real or instant

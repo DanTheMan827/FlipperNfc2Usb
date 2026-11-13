@@ -1,5 +1,5 @@
 #include "bridge.h"
-#include "cp210x_usb.h"
+#include "usb_uart.h"
 #include "mfrc522.h"
 #include "reader.h"
 
@@ -7,8 +7,11 @@
 #include <gui/gui.h>
 #include <gui/view.h>
 #include <gui/view_dispatcher.h>
+#include <gui/elements.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/variable_item_list.h>
+#include <storage/storage.h>
+#include <toolbox/saved_struct.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,9 +28,23 @@ typedef enum {
     UsbModeAcr1552u,
 } UsbMode;
 
+/* Settings kept on the SD card between runs */
+#define CONFIG_PATH    APP_DATA_PATH("settings.bin")
+#define CONFIG_MAGIC   0x52 /* 'R' */
+#define CONFIG_VERSION 1
+
+typedef struct {
+    uint8_t adapter; /* BridgeAdapter */
+    uint8_t chip_version; /* VersionReg value */
+    uint8_t strict_uart;
+    uint8_t realtime;
+    uint8_t reader_buzzer;
+} AppConfig;
+
 typedef struct {
     BridgeStatus status;
     bool show_usb_log;
+    const UsbUartBackend* usb; /* adapter whose request log is shown */
 } UartModel;
 
 typedef struct {
@@ -68,11 +85,52 @@ static const VersionOption version_options[] = {
 #define VERSION_OPTION_COUNT (sizeof(version_options) / sizeof(version_options[0]))
 
 enum {
+    SettingAdapter,
     SettingVersion,
     SettingStrict,
     SettingTiming,
     SettingPowerCycle,
 };
+
+static const UsbUartBackend* app_adapter_backend(uint8_t adapter) {
+    return adapter == BridgeAdapterCp2102 ? &usb_uart_cp2102 : &usb_uart_cdc;
+}
+
+static const char* app_uart_menu_label(uint8_t adapter) {
+    return adapter == BridgeAdapterCp2102 ? "MFRC522 UART (CP2102)" : "MFRC522 UART (CDC)";
+}
+
+/* ------------------------------------------------------------------------ */
+/* Saved configuration                                                       */
+/* ------------------------------------------------------------------------ */
+
+static void app_config_load(App* app) {
+    AppConfig c;
+    if(!saved_struct_load(CONFIG_PATH, &c, sizeof(c), CONFIG_MAGIC, CONFIG_VERSION)) return;
+    if(c.adapter < BridgeAdapterCount) app->settings.adapter = c.adapter;
+    for(size_t i = 0; i < VERSION_OPTION_COUNT; i++) {
+        if(version_options[i].value == c.chip_version) {
+            app->version_index = (uint8_t)i;
+            app->settings.version = c.chip_version;
+        }
+    }
+    app->settings.strict_uart = c.strict_uart != 0;
+    app->settings.realtime = c.realtime != 0;
+    app->reader_buzzer = c.reader_buzzer != 0;
+}
+
+static void app_config_save(App* app) {
+    AppConfig c = {
+        .adapter = app->settings.adapter,
+        .chip_version = app->settings.version,
+        .strict_uart = app->settings.strict_uart,
+        .realtime = app->settings.realtime,
+        .reader_buzzer = app->reader_buzzer,
+    };
+    if(!saved_struct_save(CONFIG_PATH, &c, sizeof(c), CONFIG_MAGIC, CONFIG_VERSION)) {
+        FURI_LOG_W("NFC2USB", "Settings not saved");
+    }
+}
 
 /* ------------------------------------------------------------------------ */
 /* Engine lifecycle                                                          */
@@ -112,6 +170,14 @@ static void app_start_engine(App* app, UsbMode mode) {
     if(mode == UsbModeMfrc522Uart) {
         app->bridge = bridge_alloc(&app->settings);
         bridge_start(app->bridge);
+        with_view_model(
+            app->uart_view,
+            UartModel * m,
+            {
+                memset(&m->status, 0, sizeof(m->status));
+                m->usb = app_adapter_backend(app->settings.adapter);
+            },
+            false);
         app->running = true;
         app_refresh(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, AppViewUartStatus);
@@ -152,43 +218,35 @@ static void mode_selected(void* context, uint32_t index) {
 /* MFRC522 UART status view                                                  */
 /* ------------------------------------------------------------------------ */
 
-static const char* cp_request_name(uint8_t r) {
-    static const char* const names[] = {
-        "IFC_EN",   "SBAUDDIV", "GBAUDDIV", "SLINE",   "GLINE",   "BREAK",
-        "IMMCHAR",  "SMHS",     "GMDMSTS",  "XON",     "XOFF",    "SEVMASK",
-        "GEVMASK",  "SCHAR",    "GCHARS",   "GPROPS",  "GCOMMST", "RESET",
-        "PURGE",    "SFLOW",    "GFLOW",    "EMBED",   "GEVSTATE", NULL,
-        NULL,       "SCHARS",   NULL,       NULL,      NULL,      "GBAUD",
-        "SBAUD"};
-    if(r < sizeof(names) / sizeof(names[0]) && names[r]) return names[r];
-    if(r == 0xFF) return "VENDOR";
-    return "?";
-}
-
-static void uart_draw_usb_log(Canvas* canvas) {
+static void uart_draw_usb_log(Canvas* canvas, const UsbUartBackend* usb) {
     char line[40];
-    Cp210xCtlLog entries[CP210X_LOG_SIZE];
-    uint32_t total, stalled;
-    cp210x_usb_get_counts(&total, &stalled);
-    size_t n = cp210x_usb_get_log(entries, 6);
+    UsbUartCtlLog entries[USB_UART_LOG_SIZE];
+    uint32_t total = 0, stalled = 0;
+    size_t n = 0;
+    if(usb) {
+        usb->get_counts(&total, &stalled);
+        n = usb->get_log(entries, 4);
+    }
 
     canvas_set_font(canvas, FontPrimary);
     snprintf(line, sizeof(line), "USB req %lu stall %lu", (unsigned long)total, (unsigned long)stalled);
     canvas_draw_str(canvas, 0, 9, line);
     canvas_set_font(canvas, FontSecondary);
     for(size_t i = 0; i < n; i++) {
-        const Cp210xCtlLog* e = &entries[i];
+        const UsbUartCtlLog* e = &entries[i];
         snprintf(
             line,
             sizeof(line),
             "%02X %-8s %04X L%u %s",
             e->request,
-            cp_request_name(e->request),
+            usb->request_name(e->request),
             e->value,
             (unsigned)e->length,
             e->stalled ? "STALL" : "ok");
         canvas_draw_str(canvas, 0, (int32_t)(19 + 9 * i), line);
     }
+    if(!n) canvas_draw_str(canvas, 0, 28, "No requests from the host yet");
+    elements_button_left(canvas, "Status");
 }
 
 static void uart_draw(Canvas* canvas, void* model_ptr) {
@@ -199,7 +257,7 @@ static void uart_draw(Canvas* canvas, void* model_ptr) {
 
     canvas_clear(canvas);
     if(model->show_usb_log) {
-        uart_draw_usb_log(canvas);
+        uart_draw_usb_log(canvas, model->usb);
         return;
     }
     canvas_set_font(canvas, FontPrimary);
@@ -213,17 +271,17 @@ static void uart_draw(Canvas* canvas, void* model_ptr) {
         return;
     }
 
+    /* Adapter, port state and the host's settings on one line */
+    bridge_format_line(s->line_ctl, fmt, sizeof(fmt));
     snprintf(
         line,
         sizeof(line),
-        "USB %s  Port %s",
-        s->usb_configured ? "up" : "--",
-        s->port_open ? "open" : "closed");
-    canvas_draw_str(canvas, 0, 20, line);
-
-    bridge_format_line(s->line_ctl, fmt, sizeof(fmt));
-    snprintf(line, sizeof(line), "Host %lu %s", (unsigned long)s->host_baud, fmt);
-    canvas_draw_str(canvas, 0, 30, line);
+        "%s %s %lu %s",
+        s->adapter ? s->adapter : "USB",
+        !s->usb_configured ? "no host" : (s->port_open ? "open" : "closed"),
+        (unsigned long)s->host_baud,
+        fmt);
+    canvas_draw_str(canvas, 0, 19, line);
 
     snprintf(
         line,
@@ -235,7 +293,7 @@ static void uart_draw(Canvas* canvas, void* model_ptr) {
         s->link_ok   ? "ok" :
         s->strict    ? "MISMATCH" :
                        "=host");
-    canvas_draw_str(canvas, 0, 40, line);
+    canvas_draw_str(canvas, 0, 28, line);
 
     snprintf(
         line,
@@ -244,10 +302,12 @@ static void uart_draw(Canvas* canvas, void* model_ptr) {
         s->soft_power_down ? "pwrdn" : (s->field_on ? "ON" : "off"),
         s->crypto_on ? " C1" : "",
         mfrc522_command_name(s->command));
-    canvas_draw_str(canvas, 0, 50, line);
+    canvas_draw_str(canvas, 0, 37, line);
 
-    canvas_draw_str(canvas, 0, 60, s->last_rf[0] ? s->last_rf : "-");
-    canvas_draw_str_aligned(canvas, 128, 0, AlignRight, AlignTop, "OK cfg >log");
+    canvas_draw_str(canvas, 0, 46, s->last_rf[0] ? s->last_rf : "-");
+
+    elements_button_center(canvas, "Config");
+    elements_button_right(canvas, "USB log");
 }
 
 static bool uart_input(InputEvent* event, void* context) {
@@ -257,9 +317,12 @@ static bool uart_input(InputEvent* event, void* context) {
         view_dispatcher_switch_to_view(app->view_dispatcher, AppViewUartSettings);
         return true;
     }
-    if(event->key == InputKeyRight || event->key == InputKeyLeft) {
+    bool on_log = false;
+    with_view_model(app->uart_view, UartModel * model, { on_log = model->show_usb_log; }, false);
+    if((event->key == InputKeyRight && !on_log) ||
+       ((event->key == InputKeyLeft || event->key == InputKeyBack) && on_log)) {
         with_view_model(
-            app->uart_view, UartModel * model, { model->show_usb_log = !model->show_usb_log; }, true);
+            app->uart_view, UartModel * model, { model->show_usb_log = !on_log; }, true);
         return true;
     }
     if(event->key == InputKeyBack) {
@@ -326,6 +389,7 @@ static bool reader_input(InputEvent* event, void* context) {
     if(event->key == InputKeyOk && app->reader) {
         app->reader_buzzer = !app->reader_buzzer;
         reader_set_buzzer(app->reader, app->reader_buzzer);
+        app_config_save(app);
         return true;
     }
     if(event->key == InputKeyBack) {
@@ -341,6 +405,30 @@ static bool reader_input(InputEvent* event, void* context) {
 
 static void app_push_settings(App* app) {
     if(app->bridge) bridge_set_settings(app->bridge, &app->settings);
+    app_config_save(app);
+}
+
+static void adapter_changed(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    app->settings.adapter = variable_item_get_current_value_index(item);
+    variable_item_set_current_value_text(item, app_adapter_backend(app->settings.adapter)->name);
+    submenu_change_item_label(
+        app->mode_menu, UsbModeMfrc522Uart, app_uart_menu_label(app->settings.adapter));
+    app_config_save(app);
+    /* The USB personality only changes on a restart: re-plug as the new adapter */
+    if(app->bridge) {
+        bridge_free(app->bridge);
+        app->bridge = bridge_alloc(&app->settings);
+        bridge_start(app->bridge);
+        with_view_model(
+            app->uart_view,
+            UartModel * m,
+            {
+                memset(&m->status, 0, sizeof(m->status));
+                m->usb = app_adapter_backend(app->settings.adapter);
+            },
+            false);
+    }
 }
 
 static void version_changed(VariableItem* item) {
@@ -385,10 +473,12 @@ static bool navigation_callback(void* context) {
 static App* app_alloc(void) {
     App* app = malloc(sizeof(App));
     memset(app, 0, sizeof(App));
+    app->settings.adapter = BridgeAdapterCdc;
     app->settings.version = version_options[0].value;
     app->settings.strict_uart = false;
     app->settings.realtime = true;
     app->reader_buzzer = true;
+    app_config_load(app);
 
     app->gui = furi_record_open(RECORD_GUI);
     app->view_dispatcher = view_dispatcher_alloc();
@@ -401,7 +491,11 @@ static App* app_alloc(void) {
     app->mode_menu = submenu_alloc();
     submenu_set_header(app->mode_menu, "USB mode");
     submenu_add_item(
-        app->mode_menu, "MFRC522 UART (CP2102)", UsbModeMfrc522Uart, mode_selected, app);
+        app->mode_menu,
+        app_uart_menu_label(app->settings.adapter),
+        UsbModeMfrc522Uart,
+        mode_selected,
+        app);
     submenu_add_item(app->mode_menu, "ACS ACR122U", UsbModeAcr122u, mode_selected, app);
     submenu_add_item(app->mode_menu, "ACS ACR1552U", UsbModeAcr1552u, mode_selected, app);
     view_dispatcher_add_view(
@@ -419,17 +513,22 @@ static App* app_alloc(void) {
     app->settings_list = variable_item_list_alloc();
     VariableItem* item;
     item = variable_item_list_add(
+        app->settings_list, "USB adapter", BridgeAdapterCount, adapter_changed, app);
+    variable_item_set_current_value_index(item, app->settings.adapter);
+    variable_item_set_current_value_text(item, app_adapter_backend(app->settings.adapter)->name);
+
+    item = variable_item_list_add(
         app->settings_list, "Chip version", VERSION_OPTION_COUNT, version_changed, app);
     variable_item_set_current_value_index(item, app->version_index);
     variable_item_set_current_value_text(item, version_options[app->version_index].label);
 
     item = variable_item_list_add(app->settings_list, "Strict UART", 2, strict_changed, app);
-    variable_item_set_current_value_index(item, 0);
-    variable_item_set_current_value_text(item, "Off");
+    variable_item_set_current_value_index(item, app->settings.strict_uart ? 1 : 0);
+    variable_item_set_current_value_text(item, app->settings.strict_uart ? "On" : "Off");
 
     item = variable_item_list_add(app->settings_list, "Wire timing", 2, timing_changed, app);
-    variable_item_set_current_value_index(item, 0);
-    variable_item_set_current_value_text(item, "Real");
+    variable_item_set_current_value_index(item, app->settings.realtime ? 0 : 1);
+    variable_item_set_current_value_text(item, app->settings.realtime ? "Real" : "Instant");
 
     item = variable_item_list_add(app->settings_list, "Power-cycle chip", 1, NULL, app);
     variable_item_set_current_value_text(item, "OK");
