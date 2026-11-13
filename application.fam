@@ -1,0 +1,12 @@
+App(
+    appid="mfrc522_uart",
+    name="Rfid2Usb",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="mfrc522_uart_app",
+    requires=["gui", "notification"],
+    stack_size=4 * 1024,
+    fap_category="NFC",
+    fap_icon="mfrc522_uart.png",
+    fap_version="1.2",
+    fap_description="Turns the Flipper into a USB NFC reader: MFRC522 in UART mode behind a CP2102 (10C4:EA60), ACS ACR122U (072F:2200) or ACS ACR1552U (072F:2303).",
+)
