@@ -22,6 +22,13 @@
 #define CCID_EP_SIZE  64
 #define CCID_INT_SIZE 8
 
+/* Standard request values (USB 2.0 tables 9-4 and 9-6) */
+#define CCID_STD_CLEAR_FEATURE  0x01
+#define CCID_FEAT_ENDPOINT_HALT 0x00
+
+/* A response the host leaves uncollected this long is dropped */
+#define CCID_TX_STALE_MS 5000
+
 static const uint8_t ep_out[CCID_MAX_IFACES] = {0x01, 0x04};
 static const uint8_t ep_in[CCID_MAX_IFACES] = {0x82, 0x85};
 static const uint8_t ep_int[CCID_MAX_IFACES] = {0x83, 0x86};
@@ -101,6 +108,7 @@ typedef struct {
     volatile size_t tx_off;
     volatile bool tx_need_zlp;
     volatile bool tx_busy;
+    volatile uint32_t tx_tick; /* last time the host took a packet */
     /* Interrupt */
     uint8_t int_buf[2];
     volatile bool int_busy;
@@ -172,6 +180,7 @@ static void ccid_read_out(usbd_device* dev, uint8_t i) {
 
 static void ccid_tx_next(usbd_device* dev, uint8_t i) {
     CcidIface* c = &ccid.iface[i];
+    c->tx_tick = furi_get_tick();
     if(c->tx_off < c->tx_len) {
         size_t n = c->tx_len - c->tx_off;
         if(n > CCID_EP_SIZE) n = CCID_EP_SIZE;
@@ -260,9 +269,39 @@ static usbd_respond ccid_ep_config(usbd_device* dev, uint8_t cfg) {
     }
 }
 
+/* The host cleared a halt on one of our endpoints (it does this to recover a
+ * pipe after a timeout): the data toggle restarts and anything in flight on
+ * that pipe is lost. Reset our side to match. The core still handles the
+ * request itself. */
+static void ccid_pipe_reset(uint8_t ep) {
+    int i = ccid_iface_of_ep(ep);
+    if(i < 0) return;
+    CcidIface* c = &ccid.iface[i];
+    if(ep == ep_in[i]) {
+        if(c->tx_busy) {
+            c->tx_busy = false;
+            c->tx_need_zlp = false;
+            c->tx_off = c->tx_len = 0;
+            ccid_notify(CCID_FLAG_TX);
+        }
+    } else if(ep == ep_out[i]) {
+        c->rx_len = 0;
+        c->msg_ready = false;
+        c->rx_deferred = false;
+    } else if(ep == ep_int[i]) {
+        c->int_busy = false;
+        c->int_pending = false;
+    }
+}
+
 static usbd_respond ccid_control(usbd_device* dev, usbd_ctlreq* req, usbd_rqc_callback* callback) {
     UNUSED(dev);
     UNUSED(callback);
+    if(req->bmRequestType == 0x02 && req->bRequest == CCID_STD_CLEAR_FEATURE &&
+       req->wValue == CCID_FEAT_ENDPOINT_HALT) {
+        ccid_pipe_reset((uint8_t)req->wIndex);
+        return usbd_fail; /* let the core clear the halt */
+    }
     if((req->bmRequestType & 0x7F) != 0x21) return usbd_fail; /* class, interface */
     switch(req->bRequest) {
     case CCID_REQ_ABORT:
@@ -442,19 +481,46 @@ size_t ccid_usb_take_message(uint8_t i, uint8_t* buf, size_t max) {
     memmove(c->rx, &c->rx[c->msg_len], extra);
     c->rx_len = extra;
     c->msg_ready = false;
-    bool deferred = c->rx_deferred;
-    c->rx_deferred = false;
+    /* A complete next message may already be buffered */
+    if(extra >= CCID_HEADER_SIZE) {
+        size_t need = CCID_HEADER_SIZE + ccid_le32(&c->rx[1]);
+        if(need > sizeof(c->rx)) {
+            c->rx_len = 0;
+        } else if(extra >= need) {
+            c->msg_len = need;
+            c->msg_ready = true;
+        }
+    }
+    bool ready = c->msg_ready;
+    bool deferred = c->rx_deferred && !ready;
+    if(deferred) c->rx_deferred = false;
     FURI_CRITICAL_EXIT();
 
+    if(ready) ccid_notify(CCID_FLAG_MSG);
     if(deferred && ccid.dev) ccid_read_out(ccid.dev, i);
     return n;
 }
 
 bool ccid_usb_tx_busy(uint8_t i) {
-    return i < ccid.interfaces && ccid.iface[i].tx_busy;
+    if(i >= ccid.interfaces) return false;
+    CcidIface* c = &ccid.iface[i];
+    if(!c->tx_busy) return false;
+    /* A response the host has not read for this long was abandoned (the host
+     * gave up on the command); drop it rather than block every later one. */
+    if(furi_get_tick() - c->tx_tick > furi_ms_to_ticks(CCID_TX_STALE_MS)) {
+        FURI_CRITICAL_ENTER();
+        c->tx_busy = false;
+        c->tx_need_zlp = false;
+        c->tx_off = c->tx_len = 0;
+        FURI_CRITICAL_EXIT();
+        FURI_LOG_W(TAG, "IN%u response not collected, dropped", i);
+        return false;
+    }
+    return true;
 }
 
 bool ccid_usb_send(uint8_t i, const uint8_t* msg, size_t len) {
+    if(i < ccid.interfaces) ccid.iface[i].tx_tick = furi_get_tick();
     if(i >= ccid.interfaces) return false;
     CcidIface* c = &ccid.iface[i];
     if(!ccid.configured || c->tx_busy || !ccid.dev || len > sizeof(c->tx)) return false;

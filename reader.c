@@ -31,6 +31,10 @@
 #define PC_TO_RDR_ICC_CLOCK        0x6E
 #define PC_TO_RDR_XFR_BLOCK        0x6F
 
+#define PC_TO_RDR_ABORT            0x72
+
+#define TIME_EXT_MS 1000 /* send a CCID time extension this often during long commands */
+
 #define RDR_TO_PC_DATA_BLOCK  0x80
 #define RDR_TO_PC_SLOT_STATUS 0x81
 #define RDR_TO_PC_PARAMETERS  0x82
@@ -414,6 +418,7 @@ static uint32_t reader_poll_interval_ms(Reader* r) {
 }
 
 static void reader_set_last(Reader* r, const char* what, const uint8_t* d, size_t n);
+static void reader_sleep(Reader* r, uint32_t ms);
 
 /* Record why a card was dropped on the status screen's last line */
 static void reader_note_loss(Reader* r, const char* what) {
@@ -1159,7 +1164,7 @@ static size_t cmd_transparent(Reader* r, const Apdu* a, uint8_t* out) {
             } else if(tag == 0x5F46 && vl == 4) {
                 uint32_t us = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) |
                               ((uint32_t)v[3] << 24);
-                furi_delay_ms((us + 999U) / 1000U);
+                reader_sleep(r, (us + 999U) / 1000U);
             } else {
                 tlv_status(&err, obj, SW_NOT_SUPPORTED);
             }
@@ -1255,9 +1260,9 @@ static size_t acr122u_ff00(Reader* r, const Apdu* a, uint8_t* out) {
             uint32_t total = 0;
             for(uint32_t i = 0; i < reps && total < LED_SEQUENCE_MAX_MS; i++) {
                 if(blink_mask) reader_led(r, (uint8_t)((r->led_state & ~blink_mask) | (initial & blink_mask)));
-                furi_delay_ms(t1);
+                reader_sleep(r, t1);
                 if(blink_mask) reader_led(r, (uint8_t)((r->led_state & ~blink_mask) | (~initial & blink_mask)));
-                furi_delay_ms(t2);
+                reader_sleep(r, t2);
                 total += t1 + t2;
             }
         }
@@ -1404,9 +1409,9 @@ static size_t acr1552u_escape(Reader* r, const uint8_t* c, size_t n, uint8_t* ou
             uint32_t off = d[1] * 10U;
             for(uint8_t i = 0; i < d[2]; i++) {
                 reader_beep(r, on);
-                furi_delay_ms(on);
+                reader_sleep(r, on);
                 reader_beep_stop(r);
-                furi_delay_ms(off);
+                reader_sleep(r, off);
             }
             return esc_reply(out, d, 3);
         }
@@ -1517,7 +1522,34 @@ static void reader_send(
     o[7] = status;
     o[8] = error;
     o[9] = b9;
-    ccid_usb_send(iface, o, CCID_HEADER_SIZE + data_len);
+    /* A time extension may still be on its way out: let it finish first */
+    for(uint32_t t = 0; ccid_usb_tx_busy(iface) && t < 200; t++) furi_delay_ms(1);
+    if(!ccid_usb_send(iface, o, CCID_HEADER_SIZE + data_len)) {
+        FURI_LOG_W(TAG, "Response %02X seq %u not sent", type, seq);
+    }
+    if(r->cur_valid && iface == r->cur_iface && seq == r->cur_seq) r->cur_valid = false;
+}
+
+/* CCID 6.2.7: while a command takes long, tell the host to keep waiting so it
+ * doesn't time out and reset the pipe. */
+static void reader_time_extension(Reader* r) {
+    if(!r->cur_valid || ccid_usb_tx_busy(r->cur_iface)) return;
+    uint8_t m[CCID_HEADER_SIZE] = {
+        r->cur_rtype, 0, 0, 0, 0, 0, r->cur_seq, 0x80 /* time extension */, 0x01, 0};
+    ccid_usb_send(r->cur_iface, m, sizeof(m));
+    r->cur_ext_tick = furi_get_tick();
+}
+
+/* Delay that keeps the host informed during long operations */
+static void reader_sleep(Reader* r, uint32_t ms) {
+    while(ms) {
+        uint32_t step = ms > 100 ? 100 : ms;
+        furi_delay_ms(step);
+        ms -= step;
+        if(r->cur_valid && furi_get_tick() - r->cur_ext_tick >= furi_ms_to_ticks(TIME_EXT_MS)) {
+            reader_time_extension(r);
+        }
+    }
 }
 
 static void reader_set_last(Reader* r, const char* what, const uint8_t* d, size_t n) {
@@ -1573,6 +1605,7 @@ static void reader_handle_sam(Reader* r, size_t len) {
     case PC_TO_RDR_ICC_POWER_OFF:
     case PC_TO_RDR_GET_SLOT_STATUS:
     case PC_TO_RDR_ICC_CLOCK:
+    case PC_TO_RDR_ABORT:
         reader_send(r, READER_IFACE_SAM, RDR_TO_PC_SLOT_STATUS, seq, 0x02, 0, 0x00, 0);
         break;
     case PC_TO_RDR_GET_PARAMETERS:
@@ -1603,6 +1636,17 @@ static void reader_handle_message(Reader* r, size_t len) {
     uint8_t* d = &r->out[CCID_HEADER_SIZE];
     const uint8_t iface = READER_IFACE_PICC;
     r->commands++;
+    r->cur_valid = true;
+    r->cur_iface = iface;
+    r->cur_seq = seq;
+    r->cur_rtype = (type == PC_TO_RDR_ICC_POWER_ON || type == PC_TO_RDR_XFR_BLOCK) ?
+                       RDR_TO_PC_DATA_BLOCK :
+                   type == PC_TO_RDR_ESCAPE         ? RDR_TO_PC_ESCAPE :
+                   type == PC_TO_RDR_GET_PARAMETERS || type == PC_TO_RDR_SET_PARAMETERS ||
+                           type == PC_TO_RDR_RESET_PARAMETERS ?
+                                                      RDR_TO_PC_PARAMETERS :
+                                                      RDR_TO_PC_SLOT_STATUS;
+    r->cur_ext_tick = furi_get_tick();
 
     if(slot != 0) {
         uint8_t rtype = (type == PC_TO_RDR_ICC_POWER_ON || type == PC_TO_RDR_XFR_BLOCK) ?
@@ -1639,6 +1683,7 @@ static void reader_handle_message(Reader* r, size_t len) {
 
     case PC_TO_RDR_GET_SLOT_STATUS:
     case PC_TO_RDR_ICC_CLOCK:
+    case PC_TO_RDR_ABORT: /* nothing runs in the background: there is nothing to abort */
         reader_send(r, iface, RDR_TO_PC_SLOT_STATUS, seq, reader_icc_status(r), 0, 0x00, 0);
         break;
 
@@ -1705,6 +1750,13 @@ static void reader_handle_message(Reader* r, size_t len) {
 /* ------------------------------------------------------------------------ */
 /* Worker                                                                    */
 /* ------------------------------------------------------------------------ */
+
+static void reader_picc_wait_hook(void* context) {
+    Reader* r = context;
+    if(r->cur_valid && furi_get_tick() - r->cur_ext_tick >= furi_ms_to_ticks(TIME_EXT_MS)) {
+        reader_time_extension(r);
+    }
+}
 
 static void reader_rf_done(const RfResult* result, void* context) {
     Reader* r = context;
@@ -1814,6 +1866,8 @@ Reader* reader_alloc(ReaderModel model) {
     r->rf_results = furi_message_queue_alloc(4, sizeof(RfResult));
     r->rf = rf_alloc(reader_rf_done, r);
     picc_init(&r->picc, r->rf, r->rf_results);
+    r->picc.wait_hook = reader_picc_wait_hook;
+    r->picc.wait_ctx = r;
     pn532_reset(&r->pn532);
     r->notification = furi_record_open(RECORD_NOTIFICATION);
 

@@ -54,8 +54,14 @@ void picc_use_tech(Picc* p, RfTech tech) {
 }
 
 static RfStatus picc_wait(Picc* p, uint32_t seq, RfResult* res, uint32_t fwt_fc) {
-    uint32_t timeout_ms = fwt_fc / 13560U + 1000U;
-    while(furi_message_queue_get(p->results, res, timeout_ms) == FuriStatusOk) {
+    uint32_t start = furi_get_tick();
+    uint32_t timeout = furi_ms_to_ticks(fwt_fc / 13560U + 1000U);
+    while(furi_get_tick() - start < timeout) {
+        /* Wait in short slices so the owner can keep the host informed */
+        if(furi_message_queue_get(p->results, res, furi_ms_to_ticks(100)) != FuriStatusOk) {
+            if(p->wait_hook) p->wait_hook(p->wait_ctx);
+            continue;
+        }
         if(res->seq == seq) {
             /* Any answer, even a corrupted one, means a card is still there */
             p->silent = res->status == RfStatusTimeout;
@@ -638,7 +644,8 @@ static bool isodep_xchg(Picc* p, const uint8_t* tx, size_t n, uint8_t* rx, size_
                 ok = picc_frame(p, tx, n, rx, rn, p->fwt_fc);
             }
         }
-        while(ok && *rn >= 2 && (rx[0] & 0xF7) == 0xF2) { /* S(WTX) */
+        for(uint8_t wtx = 0; ok && *rn >= 2 && (rx[0] & 0xF7) == 0xF2; wtx++) { /* S(WTX) */
+            if(wtx >= PICC_MAX_WTX) return false; /* card stuck asking for time */
             uint8_t wtxm = rx[1] & 0x3F;
             if(wtxm == 0) wtxm = 1;
             uint8_t s[2] = {0xF2, wtxm};

@@ -94,6 +94,13 @@ struct Reader {
     char last[40];
     uint32_t commands;
     uint32_t losses; /* cards dropped by presence check / power-on */
+
+    /* Command being processed, for CCID time extensions */
+    bool cur_valid;
+    uint8_t cur_iface;
+    uint8_t cur_seq;
+    uint8_t cur_rtype;
+    uint32_t cur_ext_tick;
 };
 
 /* reader.c helpers shared with pn532.c */

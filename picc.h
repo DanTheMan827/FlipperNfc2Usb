@@ -35,8 +35,13 @@ typedef enum {
     PiccTypePicopass,
 } PiccType;
 
+#define PICC_MAX_WTX 100 /* S(WTX) requests accepted for one block */
+
 typedef struct {
     Rf* rf;
+    /* Called about every 100 ms while waiting for a long RF exchange */
+    void (*wait_hook)(void* ctx);
+    void* wait_ctx;
     FuriMessageQueue* results; /* RfResult, filled by the RF completion callback */
     uint32_t seq;
 
